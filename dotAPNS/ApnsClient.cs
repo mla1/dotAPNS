@@ -15,8 +15,10 @@ using System.Threading.Tasks;
 using JetBrains.Annotations;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-#if !NET46
+using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Security;
+#if !NET46
 using Org.BouncyCastle.OpenSsl;
 #endif
 
@@ -31,7 +33,7 @@ namespace dotAPNS
 
         [NotNull]
         [ItemNotNull]
-        Task<ApnsResponse> SendAsync(ApplePush push, CancellationToken ct=default);
+        Task<ApnsResponse> SendAsync(ApplePush push, CancellationToken ct = default);
     }
 
     public class ApnsClient : IApnsClient
@@ -44,6 +46,9 @@ namespace dotAPNS
 #else
         readonly ECDsa _key;
 #endif
+
+        readonly ECPrivateKeyParameters _ecPrivateKeyParameter;
+        readonly bool _useBouncyCastle;
 
         readonly string _keyId;
         readonly string _teamId;
@@ -109,13 +114,30 @@ namespace dotAPNS
                 $"Make sure {nameof(ApnsJwtOptions)}.{nameof(ApnsJwtOptions.BundleId)} is set to a non-null value.");
         }
 
+        ApnsClient([NotNull] HttpClient http, [NotNull] ECPrivateKeyParameters key, [NotNull] string keyId, [NotNull] string teamId, [NotNull] string bundleId)
+        {
+            _http = http ?? throw new ArgumentNullException(nameof(http));
+            _ecPrivateKeyParameter = key ?? throw new ArgumentNullException(nameof(key));
+
+            _keyId = keyId ?? throw new ArgumentNullException(nameof(keyId),
+                $"Make sure {nameof(ApnsJwtOptions)}.{nameof(ApnsJwtOptions.KeyId)} is set to a non-null value.");
+
+            _teamId = teamId ?? throw new ArgumentNullException(nameof(teamId),
+                $"Make sure {nameof(ApnsJwtOptions)}.{nameof(ApnsJwtOptions.TeamId)} is set to a non-null value.");
+
+            _bundleId = bundleId ?? throw new ArgumentNullException(nameof(bundleId),
+                $"Make sure {nameof(ApnsJwtOptions)}.{nameof(ApnsJwtOptions.BundleId)} is set to a non-null value.");
+
+            _useBouncyCastle = true;
+        }
+
         [Obsolete("Please use " + nameof(SendAsync) + " instead.")]
         public Task<ApnsResponse> Send(ApplePush push)
         {
             return SendAsync(push);
         }
 
-        public async Task<ApnsResponse> SendAsync(ApplePush push, CancellationToken ct=default)
+        public async Task<ApnsResponse> SendAsync(ApplePush push, CancellationToken ct = default)
         {
             if (_useCert)
             {
@@ -153,7 +175,7 @@ namespace dotAPNS
 
             // Process status codes specified by APNs documentation
             // https://developer.apple.com/documentation/usernotifications/setting_up_a_remote_notification_server/handling_notification_responses_from_apns
-            var statusCode = (int)resp.StatusCode;
+            var statusCode = (int) resp.StatusCode;
 
             // Push has been successfully sent. This is the only code indicating a success as per documentation.
             if (statusCode == 200)
@@ -171,7 +193,7 @@ namespace dotAPNS
             }
             catch (JsonException ex)
             {
-                return ApnsResponse.Error(ApnsResponseReason.Unknown, 
+                return ApnsResponse.Error(ApnsResponseReason.Unknown,
                     $"Status: {statusCode}, reason: {respContent ?? "not specified"}.");
             }
 
@@ -179,7 +201,7 @@ namespace dotAPNS
             return ApnsResponse.Error(errorPayload.Reason, errorPayload.ReasonRaw);
         }
 
-        public static ApnsClient CreateUsingJwt([NotNull] HttpClient http, [NotNull] ApnsJwtOptions options)
+        public static ApnsClient CreateUsingJwt([NotNull] HttpClient http, [NotNull] ApnsJwtOptions options, bool UseBouncyCastle=false)
         {
             if (http == null) throw new ArgumentNullException(nameof(http));
             if (options == null) throw new ArgumentNullException(nameof(options));
@@ -200,9 +222,20 @@ namespace dotAPNS
                 throw new ArgumentException("Either certificate file path or certificate contents must be provided.", nameof(options));
             }
 
+            if (UseBouncyCastle)
+            {
+                var pemReader = new Org.BouncyCastle.OpenSsl.PemReader(new StringReader(certContent));
+                object pk = pemReader.ReadObject();
+
+                if (pk is ECPrivateKeyParameters ecdsaPrivateKeyParameters)
+                {
+                    return new ApnsClient(http, ecdsaPrivateKeyParameters, options.KeyId, options.TeamId, options.BundleId);
+                }
+                throw new InvalidKeyException("Key must be an ECDSA private key");
+            }
+
             certContent = certContent.Replace("\r", "").Replace("\n", "")
                 .Replace("-----BEGIN PRIVATE KEY-----", "").Replace("-----END PRIVATE KEY-----", "");
-
 #if !NET46
             certContent = $"-----BEGIN PRIVATE KEY-----\n{certContent}\n-----END PRIVATE KEY-----";
             var ecPrivateKeyParameters = (ECPrivateKeyParameters)new PemReader(new StringReader(certContent)).ReadObject();
@@ -314,15 +347,29 @@ namespace dotAPNS
                 string unsignedJwtData = $"{headerBase64}.{payloadBase64}";
 
                 byte[] signature;
-#if NET46
-                using (var dsa = new ECDsaCng(_key))
+
+                if (_useBouncyCastle)
                 {
-                    dsa.HashAlgorithm = CngAlgorithm.Sha256;
-                    signature = dsa.SignData(Encoding.UTF8.GetBytes(unsignedJwtData));
+                    var sig = SignerUtilities.GetSigner("ECDSAwithSHA256");
+                    sig.Init(true, _ecPrivateKeyParameter);
+
+                    var unsignedBytes = Encoding.UTF8.GetBytes(unsignedJwtData);
+                    sig.BlockUpdate(unsignedBytes, 0, unsignedBytes.Length);
+                    signature = sig.GenerateSignature();
                 }
+                else
+                {
+#if NET46
+                    using (var dsa = new ECDsaCng(_key))
+                    {
+                        dsa.HashAlgorithm = CngAlgorithm.Sha256;
+                        signature = dsa.SignData(Encoding.UTF8.GetBytes(unsignedJwtData));
+                    }
 #else
-                signature = _key.SignData(Encoding.UTF8.GetBytes(unsignedJwtData), HashAlgorithmName.SHA256);
+                    signature = _key.SignData(Encoding.UTF8.GetBytes(unsignedJwtData), HashAlgorithmName.SHA256);
 #endif
+                }
+
                 _jwt = $"{unsignedJwtData}.{Convert.ToBase64String(signature)}";
                 _lastJwtGenerationTime = now.UtcDateTime;
                 return _jwt;
